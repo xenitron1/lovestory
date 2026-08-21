@@ -203,7 +203,7 @@
       </section>
     </main>
 
-    <footer><span>DUO v6 • stable sync</span><span>GitHub Pages friendly</span></footer>
+    <footer><span>DUO v8 • fixed sync</span><span>GitHub Pages friendly</span></footer>
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
@@ -313,7 +313,7 @@ const dares = [
   'Сделай скриншот этой игры и придумай к нему подпись как к афише фильма.'
 ];
 
-const DUO_VERSION='7.1';
+const DUO_VERSION='8.0';
 const state = {
   role: null, name: '', names: { host: 'Игрок 1', guest: 'Игрок 2' },
   relayClients: [], relayReady: 0, relayTopic: '', cryptoKey: null, clientId: '',
@@ -710,8 +710,8 @@ async function openRelayRoom(code,{waitForPartner=false}={}){
   const mqttLib=await ensureMqtt();
   state.clientId=randomId(state.role||'player');
   state.cryptoKey=await deriveRoomKey(code);
-  const hash=await sha256Hex('DUO-ARCADE-V7|'+code);
-  const base='duo-arcade/v7/'+hash.slice(0,36);
+  const hash=await sha256Hex('DUO-ARCADE-V8|'+code);
+  const base='duo-arcade/v8/'+hash.slice(0,36);
   state.relayTopic=base+'/events';
   state.relayStateTopic=base+'/state';
   state.relayRequestTopic=base+'/request';
@@ -744,7 +744,7 @@ async function openRelayRoom(code,{waitForPartner=false}={}){
       });
     });
     client.on('message',(topic,message)=>{
-      if(topic!==state.relayTopic)return;
+      if(![state.relayTopic,state.relayStateTopic,state.relayRequestTopic].includes(topic))return;
       handleRelayPayload(message.toString(),topic);
     });
     client.on('error',err=>console.warn('DUO broker error',broker.name,err?.message||err));
@@ -760,9 +760,13 @@ async function openRelayRoom(code,{waitForPartner=false}={}){
     },5000);
     if(state.stateBeaconTimer)clearInterval(state.stateBeaconTimer);
     state.stateBeaconTimer=setInterval(()=>{
-      if(state.role==='host'&&state.connected)publishHostSnapshot();
-      else if(state.role==='guest'&&state.pendingGameRequest&&Date.now()-state.pendingGameRequest.ts<30000){
-        publishTopicEnvelope(state.relayRequestTopic,'gameRequest',state.pendingGameRequest,{qos:1,retain:true});
+      if(state.role==='host'&&state.connected){
+        publishHostSnapshot();
+      } else if(state.role==='guest'&&state.connected){
+        if(state.pendingGameRequest&&Date.now()-state.pendingGameRequest.ts<30000){
+          publishTopicEnvelope(state.relayRequestTopic,'gameRequest',state.pendingGameRequest,{qos:1,retain:true});
+        }
+        send({type:'stateRequest'},{reliable:true});
       }
     },1800);
     setStatus(false,waitForPartner?'Ищем партнёра…':'Комната готова');
@@ -863,7 +867,7 @@ function startGame(game,broadcast=true,sessionId=null){
   clearGameTimers(); state.currentGame=game;
   const sid=sessionId||randomId('game');
   state.game={sessionId:sid,round:0,picks:{},score:0,scores:{host:0,guest:0},answers:{},results:{},ratings:{},bestDates:[],truthIndex:0,truthCard:null};
-  if(broadcast)send({type:'startGame',game,sessionId:sid}); showScreen('game');
+  if(broadcast)send({type:'startGame',game,sessionId:sid},{reliable:true}); showScreen('game');
   if(game==='sync') setupBinary('✦ СОВПАДЕНИЯ','На одной волне');
   else if(game==='who') setupBinary('✦ ГОЛОСОВАНИЕ','Кто из нас?');
   else if(game==='flags') setupBinary('🚩 МНЕНИЯ','Красный или зелёный?');
@@ -874,7 +878,7 @@ function startGame(game,broadcast=true,sessionId=null){
   else if(game==='secret') setupTextGame('🔐 СЕКРЕТЫ','Секретный ответ');
   else if(game==='blitz') setupBlitz();
   else if(game==='truthdare') setupTruthDare();
-  if(state.role==='host'&&!state.demo)setTimeout(sendStateSync,80);
+  if(state.role==='host'&&!state.demo){ publishHostSnapshot(); setTimeout(sendStateSync,80); }
 }
 
 function binaryMeta(game){
