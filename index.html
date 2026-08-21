@@ -3,51 +3,78 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <meta name="theme-color" content="#100c1f" />
-  <title>Couple Arcade — игры для двоих</title>
+  <meta name="theme-color" content="#07111f" />
+  <meta name="color-scheme" content="dark" />
+  <title>DUO — игры для двоих</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="bg-orb orb-1"></div>
-  <div class="bg-orb orb-2"></div>
+  <div class="aurora aurora-a"></div>
+  <div class="aurora aurora-b"></div>
+  <div class="aurora aurora-c"></div>
+  <div class="noise"></div>
+  <div id="floatLayer" class="float-layer" aria-hidden="true"></div>
+
   <div class="app-shell">
     <header class="topbar">
       <button id="brandBtn" class="brand" type="button" aria-label="На главную">
-        <span class="brand-mark">♥</span>
-        <span>Couple Arcade</span>
+        <span class="brand-orbit"><span>♥</span></span>
+        <span class="brand-copy"><strong>DUO</strong><small>play together</small></span>
       </button>
-      <div class="status-pill" id="statusPill">
-        <span class="status-dot"></span>
-        <span id="statusText">Не подключено</span>
+
+      <div class="top-actions">
+        <div id="statusPill" class="status-pill">
+          <span class="status-dot"></span>
+          <span id="statusText">Не подключено</span>
+        </div>
       </div>
     </header>
 
     <main>
       <section id="screen-home" class="screen active">
-        <div class="hero">
-          <div class="eyebrow">ДЛЯ ДВОИХ • ПК + IPAD</div>
-          <h1>Ваш маленький игровой вечер — прямо в браузере.</h1>
-          <p class="hero-copy">Подключитесь друг к другу, выберите игру и выясните, насколько вы совпадаете, кто быстрее реагирует и кто лучше знает вашу пару.</p>
+        <div class="home-layout">
+          <div class="hero-copy-wrap">
+            <div class="eyebrow"><span class="eyebrow-dot"></span> ИГРОВОЙ ВЕЧЕР НА ДВОИХ</div>
+            <h1>Не просто созвон.<br><span>Устройте мини‑вечеринку.</span></h1>
+            <p class="hero-copy">10 игр для пары: угадывайте друг друга, спорьте, соревнуйтесь на реакцию, проходите блицы и открывайте неожиданные ответы.</p>
+
+            <div class="hero-badges">
+              <span>⚡ Без регистрации</span>
+              <span>🖥️ ПК + iPad</span>
+              <span>🔒 Прямое соединение</span>
+            </div>
+          </div>
+
+          <div class="hero-console panel">
+            <div class="console-glow"></div>
+            <div class="console-top">
+              <span class="console-label">PLAYER SETUP</span>
+              <span class="console-counter">10 GAMES</span>
+            </div>
+            <label class="label" for="playerName">Твоё имя</label>
+            <input id="playerName" class="input big-input" maxlength="18" placeholder="Например, Богдан" autocomplete="nickname" />
+            <div class="role-actions">
+              <button id="hostBtn" class="btn primary magnetic" type="button"><span>Создать игру</span><b>↗</b></button>
+              <button id="joinBtn" class="btn secondary magnetic" type="button"><span>Подключиться</span><b>↘</b></button>
+            </div>
+            <button id="demoBtn" class="btn ghost wide" type="button">Открыть демо с виртуальным партнёром</button>
+            <p class="hint compact">Сайт можно разместить на GitHub Pages. Для игры на расстоянии браузеры соединяются напрямую через WebRTC.</p>
+          </div>
         </div>
 
-        <div class="connection-grid">
-          <div class="panel setup-panel">
-            <label class="label" for="playerName">Как тебя зовут?</label>
-            <input id="playerName" class="input" maxlength="18" placeholder="Например, Богдан" autocomplete="nickname" />
+        <div class="preview-strip" aria-label="Игры">
+          <div class="preview-chip">💞 На одной волне</div>
+          <div class="preview-chip">⚡ Реакция</div>
+          <div class="preview-chip">✊ RPS</div>
+          <div class="preview-chip">🚩 Флаги</div>
+          <div class="preview-chip">🎭 Правда / вызов</div>
+          <div class="preview-chip">⏱️ Блиц</div>
+        </div>
 
-            <div class="role-actions">
-              <button id="hostBtn" class="btn primary" type="button">Создать игру</button>
-              <button id="joinBtn" class="btn secondary" type="button">Подключиться</button>
-            </div>
-            <button id="demoBtn" class="btn ghost wide" type="button">Посмотреть в демо-режиме</button>
-            <p class="hint">Для игры на расстоянии сайт использует прямое соединение между вашими браузерами. Отдельный сервер не нужен.</p>
-          </div>
-
-          <div class="panel instructions-panel">
-            <div class="step"><span>1</span><p>Один нажимает <b>«Создать игру»</b> и отправляет код второму.</p></div>
-            <div class="step"><span>2</span><p>Второй вставляет код, получает ответный и отправляет его обратно.</p></div>
-            <div class="step"><span>3</span><p>Создатель вставляет ответный код. Готово — можно играть.</p></div>
-          </div>
+        <div class="how-grid">
+          <div class="how-card"><span>01</span><strong>Создай комнату</strong><p>Получи код и отправь его девушке.</p></div>
+          <div class="how-card"><span>02</span><strong>Соединитесь</strong><p>Она вернёт ответный код — вставь его у себя.</p></div>
+          <div class="how-card"><span>03</span><strong>Выбирайте игру</strong><p>После подключения оба экрана будут синхронизированы.</p></div>
         </div>
       </section>
 
@@ -63,46 +90,85 @@
       </section>
 
       <section id="screen-lobby" class="screen">
-        <div class="lobby-head">
+        <div class="lobby-hero">
           <div>
-            <div class="eyebrow">ВЫ ВМЕСТЕ</div>
-            <h2><span id="meName">Игрок 1</span> <span class="muted">×</span> <span id="partnerName">Игрок 2</span></h2>
+            <div class="eyebrow"><span class="eyebrow-dot green"></span> ВЫ ВМЕСТЕ</div>
+            <h2><span id="meName">Игрок 1</span> <span class="versus">×</span> <span id="partnerName">Игрок 2</span></h2>
+            <p>Выбирай любую игру. Она автоматически откроется у вас обоих.</p>
           </div>
           <button id="disconnectBtn" class="btn ghost" type="button">Отключиться</button>
         </div>
 
+        <div class="game-toolbar">
+          <div><strong>Выберите режим</strong><span>10 игр • от спокойных до соревновательных</span></div>
+          <div class="legend"><span>♥ разговор</span><span>⚡ дуэль</span><span>✦ совпадения</span></div>
+        </div>
+
         <div class="game-grid">
-          <button class="game-card" data-game="sync" type="button">
-            <span class="game-icon">💞</span>
-            <span class="game-kicker">20 раундов</span>
-            <strong>На одной волне</strong>
-            <span>Выбирайте один из двух вариантов и смотрите, как часто ваши ответы совпадают.</span>
+          <button class="game-card featured" data-game="sync" type="button" style="--delay:.02s">
+            <span class="card-shine"></span><span class="game-index">01</span><span class="game-icon">💞</span>
+            <span class="game-kicker">✦ СОВПАДЕНИЯ • 16 РАУНДОВ</span><strong>На одной волне</strong>
+            <span>Два варианта, два ответа — и мгновенно видно, насколько вы сегодня совпадаете.</span>
+            <i>Играть →</i>
           </button>
 
-          <button class="game-card" data-game="who" type="button">
-            <span class="game-icon">😈</span>
-            <span class="game-kicker">18 вопросов</span>
-            <strong>Кто из нас?</strong>
-            <span>Кто дольше выбирает фильм? Кто первым мирится? Голосуйте друг за друга.</span>
+          <button class="game-card" data-game="who" type="button" style="--delay:.05s">
+            <span class="card-shine"></span><span class="game-index">02</span><span class="game-icon">😈</span>
+            <span class="game-kicker">✦ ГОЛОСОВАНИЕ • 15 ВОПРОСОВ</span><strong>Кто из нас?</strong>
+            <span>Кто чаще опаздывает, первым мирится и ворует одеяло?</span><i>Играть →</i>
           </button>
 
-          <button class="game-card" data-game="reaction" type="button">
-            <span class="game-icon">⚡</span>
-            <span class="game-kicker">5 дуэлей</span>
-            <strong>Дуэль реакции</strong>
-            <span>Ждите сигнал. Нажмёте раньше — раунд испорчен. После сигнала решают миллисекунды.</span>
+          <button class="game-card hot" data-game="reaction" type="button" style="--delay:.08s">
+            <span class="card-shine"></span><span class="game-index">03</span><span class="game-icon">⚡</span>
+            <span class="game-kicker">⚡ ДУЭЛЬ • 5 РАУНДОВ</span><strong>Реакция</strong>
+            <span>Ждите зелёный сигнал. Миллисекунды решают всё.</span><i>Играть →</i>
           </button>
 
-          <button class="game-card" data-game="secret" type="button">
-            <span class="game-icon">🔐</span>
-            <span class="game-kicker">12 тем</span>
-            <strong>Секретный ответ</strong>
-            <span>Оба пишете ответ, не видя ответа партнёра. Затем открываете их одновременно.</span>
+          <button class="game-card" data-game="rps" type="button" style="--delay:.11s">
+            <span class="card-shine"></span><span class="game-index">04</span><span class="game-icon">✊</span>
+            <span class="game-kicker">⚡ ДУЭЛЬ • ДО 5 ПОБЕД</span><strong>Камень · ножницы · бумага</strong>
+            <span>Классика, но вы не видите выбор друг друга до раскрытия.</span><i>Играть →</i>
+          </button>
+
+          <button class="game-card" data-game="flags" type="button" style="--delay:.14s">
+            <span class="card-shine"></span><span class="game-index">05</span><span class="game-icon">🚩</span>
+            <span class="game-kicker">✦ МНЕНИЯ • 14 СИТУАЦИЙ</span><strong>Красный или зелёный?</strong>
+            <span>Оценивайте ситуации в отношениях и сравнивайте взгляды.</span><i>Играть →</i>
+          </button>
+
+          <button class="game-card" data-game="would" type="button" style="--delay:.17s">
+            <span class="card-shine"></span><span class="game-index">06</span><span class="game-icon">↔️</span>
+            <span class="game-kicker">✦ ВЫБОР • 14 ДИЛЕММ</span><strong>Что бы ты выбрал?</strong>
+            <span>Неловкие, смешные и приятные дилеммы. Иногда совпасть трудно.</span><i>Играть →</i>
+          </button>
+
+          <button class="game-card" data-game="rating" type="button" style="--delay:.20s">
+            <span class="card-shine"></span><span class="game-index">07</span><span class="game-icon">⭐</span>
+            <span class="game-kicker">♥ ПЛАНЫ • 10 ИДЕЙ</span><strong>Рейтинг свиданий</strong>
+            <span>Оцените идеи от 1 до 5 и найдите ваше следующее идеальное свидание.</span><i>Играть →</i>
+          </button>
+
+          <button class="game-card" data-game="secret" type="button" style="--delay:.23s">
+            <span class="card-shine"></span><span class="game-index">08</span><span class="game-icon">🔐</span>
+            <span class="game-kicker">♥ РАЗГОВОР • 10 ТЕМ</span><strong>Секретный ответ</strong>
+            <span>Пишите одновременно. Ответы открываются только когда готовы оба.</span><i>Играть →</i>
+          </button>
+
+          <button class="game-card hot" data-game="blitz" type="button" style="--delay:.26s">
+            <span class="card-shine"></span><span class="game-index">09</span><span class="game-icon">⏱️</span>
+            <span class="game-kicker">⚡ БЛИЦ • 8 РАУНДОВ</span><strong>Ответ за 5 секунд</strong>
+            <span>Никаких долгих размышлений. Первое, что пришло в голову.</span><i>Играть →</i>
+          </button>
+
+          <button class="game-card featured" data-game="truthdare" type="button" style="--delay:.29s">
+            <span class="card-shine"></span><span class="game-index">10</span><span class="game-icon">🎭</span>
+            <span class="game-kicker">♥ ВЕЧЕРИНКА • БЕЗ ЛИМИТА</span><strong>Правда или вызов</strong>
+            <span>Мягкая парная версия: смешно, немного неловко и без жести.</span><i>Играть →</i>
           </button>
         </div>
 
         <div class="panel mini-chat">
-          <div class="chat-title">Мини-чат</div>
+          <div class="chat-head"><div><strong>💬 Мини‑чат</strong><span>на случай, если хочется подколоть соперника</span></div><span class="live-dot">LIVE</span></div>
           <div id="chatMessages" class="chat-messages" aria-live="polite"></div>
           <form id="chatForm" class="chat-form">
             <input id="chatInput" class="input" maxlength="120" placeholder="Написать что-нибудь…" />
@@ -113,7 +179,7 @@
 
       <section id="screen-game" class="screen">
         <div class="section-head game-header">
-          <button id="gameBackBtn" class="back-btn" type="button">← В игры</button>
+          <button id="gameBackBtn" class="back-btn" type="button">← Все игры</button>
           <div>
             <div class="eyebrow" id="gameKicker">ИГРА</div>
             <h2 id="gameTitle">Название игры</h2>
@@ -124,9 +190,7 @@
       </section>
     </main>
 
-    <footer>
-      <span>Сделано для двух браузеров, одного вечера и хорошего настроения.</span>
-    </footer>
+    <footer><span>DUO • made for two screens</span><span>GitHub Pages friendly</span></footer>
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
