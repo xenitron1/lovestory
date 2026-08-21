@@ -313,12 +313,14 @@ const dares = [
   'Сделай скриншот этой игры и придумай к нему подпись как к афише фильма.'
 ];
 
+const DUO_VERSION='7.1';
 const state = {
   role: null, name: '', names: { host: 'Игрок 1', guest: 'Игрок 2' },
   relayClients: [], relayReady: 0, relayTopic: '', cryptoKey: null, clientId: '',
   remoteId: '', seenMessages: new Set(), seenActions: new Set(), pendingReliable: new Map(),
   connected: false, demo: false, roomCode: '', lastRemoteSeen: 0, heartbeatTimer: null,
-  currentGame: null, game: null, timers: [], blitzInterval: null
+  currentGame: null, game: null, timers: [], blitzInterval: null,
+  relayStateTopic: '', relayRequestTopic: '', stateBeaconTimer: null, lastGameRequestId: '', pendingGameRequest: null
 };
 
 const RELIABLE_TYPES = new Set([
@@ -454,16 +456,27 @@ function rememberMessage(id){
   }
   return true;
 }
-async function publishEnvelope(kind,data={},opts={}){
-  if(!state.relayTopic) return;
-  const envelope={v:6,kind,data,sender:state.clientId,mid:opts.mid||randomId('m'),ts:Date.now()};
+async function publishTopicEnvelope(topic,kind,data={},opts={}){
+  if(!topic) return;
+  const envelope={v:7,kind,data,sender:state.clientId,mid:opts.mid||randomId('m'),ts:Date.now()};
   let payload;
   try{payload=await encodeRelayMessage(envelope);}catch(err){console.error('DUO encrypt error',err);return;}
   for(const client of state.relayClients){
     if(client.__duoReady && client.connected){
-      try{client.publish(state.relayTopic,payload,{qos:opts.qos ?? 1,retain:false});}catch(err){console.warn('DUO publish error',err);}
+      try{client.publish(topic,payload,{qos:opts.qos ?? 1,retain:!!opts.retain});}catch(err){console.warn('DUO publish error',err);}
     }
   }
+}
+function publishEnvelope(kind,data={},opts={}){ return publishTopicEnvelope(state.relayTopic,kind,data,opts); }
+function publishHostSnapshot(){
+  if(state.role!=='host' || !state.relayStateTopic || !state.connected)return;
+  return publishTopicEnvelope(state.relayStateTopic,'stateSnapshot',snapshotState(),{qos:1,retain:true});
+}
+function publishGameRequest(game){
+  if(state.role!=='guest' || !state.relayRequestTopic)return;
+  const requestId=randomId('req');
+  state.pendingGameRequest={requestId,game,ts:Date.now()};
+  return publishTopicEnvelope(state.relayRequestTopic,'gameRequest',{requestId,game,ts:Date.now(),name:state.name},{qos:1,retain:true});
 }
 function rememberAction(id){
   if(!id || state.seenActions.has(id)) return false;
@@ -493,11 +506,32 @@ function touchRemote(){
   state.lastRemoteSeen=Date.now();
   if(state.connected && $('#statusText').textContent!=='На связи') setStatus(true,'На связи');
 }
-async function handleRelayPayload(payload){
+async function handleRelayPayload(payload,sourceTopic=''){
   let env;
   try{ env=await decodeRelayMessage(payload); }catch{return;}
-  if(!env || env.v!==6 || env.sender===state.clientId || !rememberMessage(env.mid)) return;
+  if(!env || ![6,7].includes(env.v) || env.sender===state.clientId || !rememberMessage(env.mid)) return;
   touchRemote();
+  if(env.kind==='stateSnapshot' && sourceTopic===state.relayStateTopic){
+    if(Date.now()-Number(env.ts||0)>120000)return;
+    if(!state.remoteId)state.remoteId=env.sender;
+    if(!state.connected)onConnected();
+    if(state.role==='guest' && env.data) applyStateSync(env.data);
+    return;
+  }
+  if(env.kind==='gameRequest' && sourceTopic===state.relayRequestTopic){
+    if(!state.remoteId)state.remoteId=env.sender;
+    if(!state.connected)onConnected();
+    if(state.role==='host'){
+      const req=env.data||{};
+      const fresh=Number(req.ts)&&Date.now()-Number(req.ts)<30000;
+      if(fresh && req.requestId && !req.handled && req.requestId!==state.lastGameRequestId && !state.currentGame && req.game){
+        state.lastGameRequestId=req.requestId;
+        startGame(req.game,true);
+        publishTopicEnvelope(state.relayRequestTopic,'gameRequest',{requestId:req.requestId,handled:true,ts:Date.now()},{qos:1,retain:true});
+      }
+    }
+    return;
+  }
   if(env.kind==='ack'){
     if(!state.remoteId || env.sender===state.remoteId) stopReliable(env.data?.rid);
     return;
@@ -541,7 +575,7 @@ function onConnected(){
   send({type:'profile',role:state.role,name:state.name},{reliable:false});
   if(firstConnection)sprinkle(8);
   if(!state.currentGame)setTimeout(enterLobby,180);
-  else if(state.role==='host')setTimeout(sendStateSync,120);
+  if(state.role==='host')setTimeout(()=>{sendStateSync();publishHostSnapshot();},120);
   else setTimeout(()=>send({type:'stateRequest'},{reliable:true}),120);
 }
 function enterLobby(){
@@ -552,7 +586,7 @@ function sameSession(msg){return !msg?.sessionId || !state.game?.sessionId || ms
 function snapshotState(){
   return {type:'stateSync',currentGame:state.currentGame,game:state.game?JSON.parse(JSON.stringify(state.game)):null,names:{...state.names},sessionId:state.game?.sessionId||null};
 }
-function sendStateSync(){if(state.role==='host'&&state.connected)send(snapshotState(),{reliable:true});}
+function sendStateSync(){if(state.role==='host'&&state.connected){send(snapshotState(),{reliable:true});publishHostSnapshot();}}
 function renderStateAfterSync(previousOwn={}){
   if(!state.currentGame||!state.game){showScreen('lobby');return;}
   showScreen('game');
@@ -589,6 +623,7 @@ function applyStateSync(msg){
   if(state.role!=='guest')return;
   if(msg.names)state.names={...state.names,...msg.names};
   if(!msg.currentGame){clearGameTimers();state.currentGame=null;state.game=null;enterLobby();return;}
+  state.pendingGameRequest=null;
   const oldGame=state.game;
   const same=oldGame?.sessionId&&msg.game?.sessionId&&oldGame.sessionId===msg.game.sessionId;
   const sameRound=same&&Number(oldGame.round)===Number(msg.game.round);
@@ -626,18 +661,18 @@ function receive(msg){
     case 'stateRequest': if(state.role==='host')sendStateSync(); break;
     case 'stateSync': applyStateSync(msg); break;
     case 'chat': addChat(msg.text,false,msg.name); break;
-    case 'requestStartGame': if(state.role==='host'&&!state.currentGame)startGame(msg.game,true); break;
-    case 'startGame': startGame(msg.game,false,msg.sessionId); break;
+    case 'requestStartGame': if(state.role==='host'&&!state.currentGame&&msg.game)startGame(msg.game,true); break;
+    case 'startGame': state.pendingGameRequest=null; startGame(msg.game,false,msg.sessionId); break;
     case 'leaveGame': if(sameSession(msg)){clearGameTimers();state.currentGame=null;state.game=null;showScreen('lobby');} break;
-    case 'pick': if(state.currentGame===msg.game && sameSession(msg) && state.game){state.game.picks[msg.role]=msg.choice; resolvePick();} break;
+    case 'pick': if(state.currentGame===msg.game && sameSession(msg) && state.game){state.game.picks[msg.role]=msg.choice; resolvePick(); if(state.role==='host')sendStateSync();} break;
     case 'nextRound': if(state.currentGame===msg.game && sameSession(msg)) nextRound(false); break;
     case 'reactionArm': if(state.currentGame==='reaction' && sameSession(msg)) armReaction(msg.round,msg.delay,false); break;
-    case 'reactionResult': if(state.currentGame==='reaction' && sameSession(msg) && state.role==='host'){state.game.results[msg.role]=msg.time;maybeRevealReaction();} break;
+    case 'reactionResult': if(state.currentGame==='reaction' && sameSession(msg) && state.role==='host'){state.game.results[msg.role]=msg.time;maybeRevealReaction();sendStateSync();} break;
     case 'reactionReveal': if(state.currentGame==='reaction' && sameSession(msg)) showReactionReveal(msg); break;
-    case 'textSubmit': if(state.currentGame===msg.game && sameSession(msg)){state.game.answers[msg.role]=msg.text; resolveTextRound();} break;
+    case 'textSubmit': if(state.currentGame===msg.game && sameSession(msg)){state.game.answers[msg.role]=msg.text; resolveTextRound(); if(state.role==='host')sendStateSync();} break;
     case 'blitzArm': if(state.currentGame==='blitz' && sameSession(msg)) armBlitz(msg.round,false); break;
-    case 'ratingSubmit': if(state.currentGame==='rating' && sameSession(msg)){state.game.ratings[msg.role]=Number(msg.rating);resolveRating();} break;
-    case 'truthCard': if(state.currentGame==='truthdare' && sameSession(msg)) showTruthCard(msg.mode,msg.text,msg.index,false); break;
+    case 'ratingSubmit': if(state.currentGame==='rating' && sameSession(msg)){state.game.ratings[msg.role]=Number(msg.rating);resolveRating(); if(state.role==='host')sendStateSync();} break;
+    case 'truthCard': if(state.currentGame==='truthdare' && sameSession(msg)){showTruthCard(msg.mode,msg.text,msg.index,false); if(state.role==='host')sendStateSync();} break;
   }
 }
 
@@ -663,19 +698,23 @@ function destroyPeer(){
   if(state.relayClients.length && state.relayTopic) publishEnvelope('bye',{}, {qos:0});
   for(const rid of [...state.pendingReliable.keys()])stopReliable(rid);
   if(state.heartbeatTimer){clearInterval(state.heartbeatTimer);state.heartbeatTimer=null;}
+  if(state.stateBeaconTimer){clearInterval(state.stateBeaconTimer);state.stateBeaconTimer=null;}
   for(const client of state.relayClients){
     try{client.end(true);}catch{}
   }
-  state.relayClients=[]; state.relayReady=0; state.relayTopic=''; state.cryptoKey=null;
-  state.clientId=''; state.remoteId=''; state.seenMessages=new Set(); state.seenActions=new Set(); state.roomCode=''; state.lastRemoteSeen=0;
+  state.relayClients=[]; state.relayReady=0; state.relayTopic=''; state.relayStateTopic=''; state.relayRequestTopic=''; state.cryptoKey=null;
+  state.clientId=''; state.remoteId=''; state.seenMessages=new Set(); state.seenActions=new Set(); state.roomCode=''; state.lastRemoteSeen=0; state.lastGameRequestId=''; state.pendingGameRequest=null;
 }
 
 async function openRelayRoom(code,{waitForPartner=false}={}){
   const mqttLib=await ensureMqtt();
   state.clientId=randomId(state.role||'player');
   state.cryptoKey=await deriveRoomKey(code);
-  const hash=await sha256Hex('DUO-ARCADE-V6|'+code);
-  state.relayTopic='duo-arcade/v6/'+hash.slice(0,36)+'/events';
+  const hash=await sha256Hex('DUO-ARCADE-V7|'+code);
+  const base='duo-arcade/v7/'+hash.slice(0,36);
+  state.relayTopic=base+'/events';
+  state.relayStateTopic=base+'/state';
+  state.relayRequestTopic=base+'/request';
   state.relayClients=[]; state.relayReady=0; state.remoteId=''; state.seenMessages=new Set(); state.seenActions=new Set();
 
   let firstReadyResolve, firstReadyReject;
@@ -696,16 +735,17 @@ async function openRelayRoom(code,{waitForPartner=false}={}){
     client.__duoReady=false; client.__duoName=broker.name;
     state.relayClients.push(client);
     client.on('connect',()=>{
-      client.subscribe(state.relayTopic,{qos:1},err=>{
+      client.subscribe([state.relayTopic,state.relayStateTopic,state.relayRequestTopic],{qos:1},err=>{
         if(err){console.warn('DUO subscribe failed',broker.name,err);return;}
         if(!client.__duoReady){client.__duoReady=true;state.relayReady++;}
         if(!settled){settled=true;clearTimeout(timeout);firstReadyResolve(broker.name);}
         publishEnvelope('hello',{role:state.role,name:state.name});
+        if(state.role==='host')setTimeout(publishHostSnapshot,120);
       });
     });
     client.on('message',(topic,message)=>{
       if(topic!==state.relayTopic)return;
-      handleRelayPayload(message.toString());
+      handleRelayPayload(message.toString(),topic);
     });
     client.on('error',err=>console.warn('DUO broker error',broker.name,err?.message||err));
     client.on('close',()=>{if(client.__duoReady){client.__duoReady=false;state.relayReady=Math.max(0,state.relayReady-1);}});
@@ -718,6 +758,13 @@ async function openRelayRoom(code,{waitForPartner=false}={}){
       if(state.relayTopic)publishEnvelope('ping',{}, {qos:0});
       if(state.connected && state.lastRemoteSeen && Date.now()-state.lastRemoteSeen>14000)setStatus(true,'Связь восстанавливается…');
     },5000);
+    if(state.stateBeaconTimer)clearInterval(state.stateBeaconTimer);
+    state.stateBeaconTimer=setInterval(()=>{
+      if(state.role==='host'&&state.connected)publishHostSnapshot();
+      else if(state.role==='guest'&&state.pendingGameRequest&&Date.now()-state.pendingGameRequest.ts<30000){
+        publishTopicEnvelope(state.relayRequestTopic,'gameRequest',state.pendingGameRequest,{qos:1,retain:true});
+      }
+    },1800);
     setStatus(false,waitForPartner?'Ищем партнёра…':'Комната готова');
     return brokerName;
   }catch(err){
@@ -806,7 +853,13 @@ function startDemo(){state.demo=true;state.role='host';state.name=cleanName($('#
 function addChat(text,mine,name){const t=(text||'').trim();if(!t)return;const box=document.createElement('div');box.className='chat-msg'+(mine?' mine':'');box.textContent=mine?t:`${name||'Партнёр'}: ${t}`;$('#chatMessages').appendChild(box);$('#chatMessages').scrollTop=$('#chatMessages').scrollHeight;}
 
 function startGame(game,broadcast=true,sessionId=null){
-  if(broadcast && state.role==='guest' && !state.demo){send({type:'requestStartGame',game},{reliable:true});toast('Запрос на запуск отправлен');return;}
+  if(broadcast && state.role==='guest' && !state.demo){
+    publishGameRequest(game);
+    send({type:'requestStartGame',game},{reliable:true});
+    toast('Запускаем игру у обоих…');
+    setTimeout(()=>send({type:'stateRequest'},{reliable:true}),700);
+    return;
+  }
   clearGameTimers(); state.currentGame=game;
   const sid=sessionId||randomId('game');
   state.game={sessionId:sid,round:0,picks:{},score:0,scores:{host:0,guest:0},answers:{},results:{},ratings:{},bestDates:[],truthIndex:0,truthCard:null};
@@ -821,6 +874,7 @@ function startGame(game,broadcast=true,sessionId=null){
   else if(game==='secret') setupTextGame('🔐 СЕКРЕТЫ','Секретный ответ');
   else if(game==='blitz') setupBlitz();
   else if(game==='truthdare') setupTruthDare();
+  if(state.role==='host'&&!state.demo)setTimeout(sendStateSync,80);
 }
 
 function binaryMeta(game){
@@ -839,7 +893,7 @@ function renderBinaryRound(preserve=false){
 function makePick(choice){
   if(state.game.picks[state.role]!=null)return; state.game.picks[state.role]=choice;
   $$('.choice-btn').forEach(b=>{b.disabled=true;b.classList.toggle('selected',b.dataset.choice===choice)}); $('#waiting').textContent='Ответ принят. Ждём партнёра…';
-  send({type:'pick',game:state.currentGame,role:state.role,choice,sessionId:state.game.sessionId}); resolvePick();
+  send({type:'pick',game:state.currentGame,role:state.role,choice,sessionId:state.game.sessionId}); resolvePick(); if(state.role==='host')sendStateSync();
 }
 function labelForChoice(game,choice){
   const i=state.game.round;
@@ -886,7 +940,7 @@ function renderReactionReady(preserve=false){const r=state.game.round;if(r>=5)re
   $('#gameArea').innerHTML=`<div class="panel game-panel"><div class="prompt">Раунд ${r+1}</div><p class="subprompt">Не нажимайте ничего, пока поле не станет зелёным.</p><div class="reaction-stage"><div class="reaction-wait"><strong>Готовы?</strong>${state.role==='host'?'Запусти раунд, когда оба готовы.':'Создатель игры сейчас запустит раунд.'}</div></div><div class="next-wrap">${state.role==='host'?'<button id="armBtn" class="btn primary">Запустить</button>':''}</div><div class="score-row"><span class="score-chip">${esc(state.names.host)}: ${state.game.scores.host}</span><span class="score-chip">${esc(state.names.guest)}: ${state.game.scores.guest}</span></div></div>`;
   if(state.role==='host')$('#armBtn').onclick=()=>armReaction(r,1700+Math.round(Math.random()*2800),true);
 }
-function armReaction(round,delay,broadcast){if(broadcast)send({type:'reactionArm',round,delay,sessionId:state.game.sessionId});else if(Number.isFinite(Number(round)))state.game.round=Number(round);clearGameTimers();state.game.results={};const stage=$('.reaction-stage');stage.className='reaction-stage';stage.innerHTML='<div class="reaction-wait"><strong>Не нажимай…</strong>Жди зелёный сигнал.</div>';$('.next-wrap').innerHTML='';let live=false,start=0;
+function armReaction(round,delay,broadcast){if(broadcast)send({type:'reactionArm',round,delay,sessionId:state.game.sessionId});else if(Number.isFinite(Number(round)))state.game.round=Number(round);if(broadcast&&state.role==='host')sendStateSync();clearGameTimers();state.game.results={};const stage=$('.reaction-stage');stage.className='reaction-stage';stage.innerHTML='<div class="reaction-wait"><strong>Не нажимай…</strong>Жди зелёный сигнал.</div>';$('.next-wrap').innerHTML='';let live=false,start=0;
   stage.onclick=()=>{if(!live){clearGameTimers();const time=9999;state.game.results[state.role]=time;send({type:'reactionResult',role:state.role,time,sessionId:state.game.sessionId});stage.classList.add('early');stage.innerHTML='<div class="reaction-wait"><strong>Слишком рано 😅</strong>Фальстарт.</div>';stage.onclick=null;if(state.role==='host')maybeRevealReaction();}};
   const t=setTimeout(()=>{live=true;start=performance.now();stage.onclick=null;stage.classList.add('go');stage.innerHTML='<button class="reaction-button">ЖМИ!</button>';$('.reaction-button').onclick=()=>{const time=Math.round(performance.now()-start);state.game.results[state.role]=time;send({type:'reactionResult',role:state.role,time,sessionId:state.game.sessionId});stage.className='reaction-stage';stage.innerHTML=`<div class="reaction-wait"><strong>${time} мс</strong>Ждём партнёра…</div>`;if(state.role==='host')maybeRevealReaction();};},delay);state.timers.push(t);
 }
@@ -899,7 +953,7 @@ function renderRatingRound(preserve=false){const i=state.game.round;if(i>=dateId
   $('#gameArea').innerHTML=`<div class="panel game-panel"><div class="prompt">${esc(dateIdeas[i])}</div><p class="subprompt">Насколько тебе хочется устроить такое свидание?</p><div class="ratings">${[1,2,3,4,5].map(n=>`<button class="rating-btn" data-rating="${n}"><strong>${n}</strong>${n===1?'не моё':n===5?'хочу!':''}</button>`).join('')}</div><div id="waiting" class="waiting">Поставь оценку от 1 до 5.</div><div id="revealBox"></div>${progress(i,dateIdeas.length)}</div>`;
   $$('.rating-btn').forEach(b=>b.onclick=()=>submitRating(Number(b.dataset.rating)));
 }
-function submitRating(r){if(state.game.ratings[state.role]!=null)return;state.game.ratings[state.role]=r;$$('.rating-btn').forEach(b=>{b.disabled=true;b.classList.toggle('selected',Number(b.dataset.rating)===r)});$('#waiting').textContent='Оценка принята. Ждём партнёра…';send({type:'ratingSubmit',role:state.role,rating:r,sessionId:state.game.sessionId});resolveRating();}
+function submitRating(r){if(state.game.ratings[state.role]!=null)return;state.game.ratings[state.role]=r;$$('.rating-btn').forEach(b=>{b.disabled=true;b.classList.toggle('selected',Number(b.dataset.rating)===r)});$('#waiting').textContent='Оценка принята. Ждём партнёра…';send({type:'ratingSubmit',role:state.role,rating:r,sessionId:state.game.sessionId});resolveRating();if(state.role==='host')sendStateSync();}
 function resolveRating(countStats=true){const a=state.game.ratings.host,b=state.game.ratings.guest;if(a==null||b==null)return;const avg=(a+b)/2,diff=Math.abs(a-b);const key=`rating:${state.game.round}`;state.game.resolved=state.game.resolved||{};if(countStats&&!state.game.resolved[key]){if(avg>=4)state.game.bestDates.push({idea:dateIdeas[state.game.round],avg});state.game.resolved[key]=true;if(diff<=1)sprinkle(3)}$('#waiting').textContent='';
   $('#revealBox').innerHTML=`<div class="reveal ${diff===0?'match':''}"><div class="reveal-title">${diff===0?'Одинаковая оценка ✦':avg>=4?'Похоже, стоит попробовать':'Мнения разделились'}</div><div class="rating-reveal"><div class="rating-card">${esc(state.names.host)}<strong>${a}★</strong></div><div class="rating-card">${esc(state.names.guest)}<strong>${b}★</strong></div></div><div class="next-wrap">${state.role==='host'?'<button id="ratingNext" class="btn primary">Следующая идея</button>':'<span class="hint">Ждём следующую идею…</span>'}</div></div>`;if(state.role==='host')$('#ratingNext').onclick=()=>nextRound(true);
 }
@@ -910,7 +964,7 @@ function renderTextRound(preserve=false){const i=state.game.round;if(i>=secretPr
   $('#gameArea').innerHTML=`<div class="panel game-panel"><div class="prompt">${esc(secretPrompts[i])}</div><p class="subprompt">Ответ партнёра откроется только после того, как ответят оба.</p><form id="textForm" class="secret-form"><textarea id="textInput" class="textarea secret-input" maxlength="260" placeholder="Твой секретный ответ…"></textarea><button class="btn primary" type="submit">Зафиксировать ответ</button></form><div id="waiting" class="waiting"></div><div id="revealBox"></div>${progress(i,secretPrompts.length)}</div>`;
   $('#textForm').onsubmit=e=>{e.preventDefault();submitText($('#textInput').value.trim());};
 }
-function submitText(text){if(!text)return toast('Сначала напиши ответ');if(state.game.answers[state.role])return;state.game.answers[state.role]=text;$('#textInput').disabled=true;$('#textForm button').disabled=true;$('#waiting').textContent='Ответ спрятан 🔐 Ждём партнёра…';send({type:'textSubmit',game:state.currentGame,role:state.role,text,sessionId:state.game.sessionId});resolveTextRound();}
+function submitText(text){if(!text)return toast('Сначала напиши ответ');if(state.game.answers[state.role])return;state.game.answers[state.role]=text;$('#textInput').disabled=true;$('#textForm button').disabled=true;$('#waiting').textContent='Ответ спрятан 🔐 Ждём партнёра…';send({type:'textSubmit',game:state.currentGame,role:state.role,text,sessionId:state.game.sessionId});resolveTextRound();if(state.role==='host')sendStateSync();}
 function resolveTextRound(){const a=state.game?.answers.host,b=state.game?.answers.guest;if(!a||!b)return;$('#waiting').textContent='';$('#revealBox').innerHTML=`<div class="secret-cards"><div class="secret-card"><span>${esc(state.names.host)}</span><strong>${esc(a)}</strong></div><div class="secret-card"><span>${esc(state.names.guest)}</span><strong>${esc(b)}</strong></div></div><div class="next-wrap">${state.role==='host'?'<button id="textNext" class="btn primary">Следующая тема</button>':'<span class="hint">Ждём следующую тему…</span>'}</div>`;sprinkle(2);if(state.role==='host')$('#textNext').onclick=()=>nextRound(true);}
 function finishTextGame(){ $('#roundBadge').textContent='Финиш';$('#gameArea').innerHTML=finishHtml('💌','Десять маленьких открытий','Теперь у вас точно есть несколько новых тем, идей и поводов улыбнуться.');celebrate(30);wireFinish(); }
 
@@ -919,13 +973,13 @@ function renderBlitzReady(preserve=false){const i=state.game.round;if(i>=blitzPr
   $('#gameArea').innerHTML=`<div class="panel game-panel"><div class="prompt">Раунд ${i+1}</div><p class="subprompt">После старта у обоих будет только 5 секунд.</p><div class="truth-card"><div class="truth-icon">⏱️</div><div class="truth-label">БЛИЦ</div><strong>${esc(blitzPrompts[i])}</strong></div><div class="next-wrap">${state.role==='host'?'<button id="blitzStart" class="btn primary">Запустить 5 секунд</button>':'<span class="hint">Создатель запустит таймер…</span>'}</div></div>`;
   if(state.role==='host')$('#blitzStart').onclick=()=>armBlitz(i,true);
 }
-function armBlitz(round,broadcast){if(broadcast)send({type:'blitzArm',round,sessionId:state.game.sessionId});else if(Number.isFinite(Number(round)))state.game.round=Number(round);clearGameTimers();state.game.answers={};let left=5;
+function armBlitz(round,broadcast){if(broadcast)send({type:'blitzArm',round,sessionId:state.game.sessionId});else if(Number.isFinite(Number(round)))state.game.round=Number(round);if(broadcast&&state.role==='host')sendStateSync();clearGameTimers();state.game.answers={};let left=5;
   $('#gameArea').innerHTML=`<div class="panel game-panel"><div class="timer-ring" style="--pct:100%"><strong id="timerNum">5</strong></div><div class="prompt">${esc(blitzPrompts[state.game.round])}</div><form id="blitzForm" class="secret-form"><input id="blitzInput" class="input big-input" maxlength="100" autocomplete="off" placeholder="Пиши первое, что пришло в голову…"><button class="btn primary">Ответить</button></form><div id="waiting" class="waiting"></div><div id="revealBox"></div></div>`;
   setTimeout(()=>$('#blitzInput')?.focus(),50);
   $('#blitzForm').onsubmit=e=>{e.preventDefault();const t=$('#blitzInput').value.trim()||'…';submitBlitz(t);};
   state.blitzInterval=setInterval(()=>{left--;const n=$('#timerNum'),ring=$('.timer-ring');if(n)n.textContent=left;if(ring)ring.style.setProperty('--pct',(left/5*100)+'%');if(left<=0){clearInterval(state.blitzInterval);state.blitzInterval=null;if(!state.game.answers[state.role])submitBlitz('Не успел(а) 😅');}},1000);
 }
-function submitBlitz(text){if(state.game.answers[state.role])return;state.game.answers[state.role]=text;if($('#blitzInput'))$('#blitzInput').disabled=true;if($('#blitzForm button'))$('#blitzForm button').disabled=true;$('#waiting').textContent='Готово! Ждём второй ответ…';send({type:'textSubmit',game:'blitz',role:state.role,text,sessionId:state.game.sessionId});resolveTextRound();}
+function submitBlitz(text){if(state.game.answers[state.role])return;state.game.answers[state.role]=text;if($('#blitzInput'))$('#blitzInput').disabled=true;if($('#blitzForm button'))$('#blitzForm button').disabled=true;$('#waiting').textContent='Готово! Ждём второй ответ…';send({type:'textSubmit',game:'blitz',role:state.role,text,sessionId:state.game.sessionId});resolveTextRound();if(state.role==='host')sendStateSync();}
 function finishBlitz(){ $('#roundBadge').textContent='Финиш';$('#gameArea').innerHTML=finishHtml('🔥','Блиц пройден','В первом ответе часто прячется самое смешное. Теперь можно поспорить, чей был лучше.');celebrate(34);wireFinish(); }
 
 function setupTruthDare(){ $('#gameKicker').textContent='🎭 ВЕЧЕРИНКА';$('#gameTitle').textContent='Правда или вызов';$('#roundBadge').textContent='∞';renderTruthChooser(); }
@@ -934,7 +988,7 @@ function renderTruthChooser(){
   $('#gameArea').innerHTML=`<div class="panel game-panel"><div class="prompt">Что выбираете?</div><p class="subprompt">Карточку выбирает создатель комнаты, и она мгновенно появляется у обоих.</p>${state.role==='host'?`<div class="truth-controls"><button class="truth-mode" data-mode="truth"><span>💬</span>Правда</button><button class="truth-mode" data-mode="dare"><span>🎯</span>Вызов</button><button class="truth-mode" data-mode="random"><span>🎲</span>Случайно</button></div>`:'<div class="truth-card"><div class="truth-icon">🎭</div><div class="truth-label">ЖДЁМ</div><strong>Создатель выбирает следующую карточку…</strong></div>'}</div>`;
   if(state.role==='host')$$('.truth-mode').forEach(b=>b.onclick=()=>drawTruthCard(b.dataset.mode,true));
 }
-function drawTruthCard(mode,broadcast){if(mode==='random')mode=Math.random()<.5?'truth':'dare';const list=mode==='truth'?truths:dares;const index=Math.floor(Math.random()*list.length),text=list[index];if(broadcast)send({type:'truthCard',mode,text,index,sessionId:state.game.sessionId});showTruthCard(mode,text,index,true);}
+function drawTruthCard(mode,broadcast){if(mode==='random')mode=Math.random()<.5?'truth':'dare';const list=mode==='truth'?truths:dares;const index=Math.floor(Math.random()*list.length),text=list[index];if(broadcast)send({type:'truthCard',mode,text,index,sessionId:state.game.sessionId});showTruthCard(mode,text,index,true);if(state.role==='host')sendStateSync();}
 function showTruthCard(mode,text,index,local){
   if(state.game)state.game.truthCard={mode,text,index};
   $('#gameArea').innerHTML=`<div class="panel game-panel"><div class="truth-card"><div class="truth-icon">${mode==='truth'?'💬':'🎯'}</div><div class="truth-label">${mode==='truth'?'ПРАВДА':'ВЫЗОВ'}</div><strong>${esc(text)}</strong></div><div class="next-wrap">${state.role==='host'?'<button id="truthNext" class="btn primary">Следующая карточка</button>':'<span class="hint">Когда будете готовы, создатель откроет следующую.</span>'}</div></div>`;sprinkle(2);if(state.role==='host')$('#truthNext').onclick=renderTruthChooser;
@@ -942,7 +996,7 @@ function showTruthCard(mode,text,index,local){
 
 function finishHtml(emoji,title,text){return `<div class="panel game-panel finish"><div class="finish-emoji">${emoji}</div><h3>${esc(title)}</h3><p>${esc(text)}</p><div class="signal-actions" style="justify-content:center"><button id="playAgainBtn" class="btn primary">Сыграть ещё раз</button><button id="toLobbyBtn" class="btn ghost">Другие игры</button></div></div>`;}
 function wireFinish(){ $('#playAgainBtn').onclick=()=>startGame(state.currentGame,true); $('#toLobbyBtn').onclick=leaveGame; }
-function leaveGame(){clearGameTimers();const sessionId=state.game?.sessionId||null;send({type:'leaveGame',sessionId});state.currentGame=null;state.game=null;showScreen('lobby');}
+function leaveGame(){clearGameTimers();const sessionId=state.game?.sessionId||null;send({type:'leaveGame',sessionId});state.currentGame=null;state.game=null;state.pendingGameRequest=null;showScreen('lobby');if(state.role==='host'&&!state.demo)setTimeout(sendStateSync,60);}
 function clearGameTimers(){state.timers.forEach(clearTimeout);state.timers=[];if(state.blitzInterval){clearInterval(state.blitzInterval);state.blitzInterval=null;}}
 function disconnect(){clearGameTimers();destroyPeer();state.connected=false;state.demo=false;state.role=null;setStatus(false,'Не подключено');$('#chatMessages').innerHTML='';showScreen('home');}
 
