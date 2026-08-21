@@ -71,7 +71,7 @@
               <button id="joinBtn" class="btn secondary magnetic" type="button"><span>Подключиться</span><b>↘</b></button>
             </div>
             <button id="demoBtn" class="btn ghost wide" type="button">Открыть демо с виртуальным партнёром</button>
-            <p class="hint compact">Сайт работает на GitHub Pages. Для подключения достаточно короткого кода комнаты — никаких длинных WebRTC-кодов.</p>
+            <p class="hint compact">Сайт работает на GitHub Pages. Для подключения достаточно короткого кода комнаты — никаких длинных онлайн-кодов.</p>
           </div>
         </div>
 
@@ -207,7 +207,6 @@
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js" onerror="var s=document.createElement('script');s.src='https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js';document.head.appendChild(s)"></script>
   <script>
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -316,7 +315,8 @@ const dares = [
 
 const state = {
   role: null, name: '', names: { host: 'Игрок 1', guest: 'Игрок 2' },
-  peer: null, channel: null, connected: false, demo: false, roomCode: '',
+  relayClients: [], relayReady: 0, relayTopic: '', cryptoKey: null, clientId: '',
+  remoteId: '', seenMessages: new Set(), connected: false, demo: false, roomCode: '',
   currentGame: null, game: null, timers: [], blitzInterval: null
 };
 
@@ -363,35 +363,125 @@ function makeRoomCode(){
   for(let i=0;i<6;i++) code+=chars[Math.floor(Math.random()*chars.length)];
   return code;
 }
-function peerIdFromCode(code){ return 'duo-'+String(code||'').trim().toLowerCase(); }
-function peerReady(){ return typeof window.Peer === 'function'; }
-function peerOptions(){ return {debug:1,config:{iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'}]}}; }
-function peerErrorMessage(err){
-  const type=err?.type || '';
-  if(type==='peer-unavailable') return 'Комната не найдена. Проверь 6-значный код.';
-  if(type==='unavailable-id') return 'Такой код уже занят. Создаю другой…';
-  if(type==='network' || type==='server-error' || type==='socket-error' || type==='socket-closed') return 'Не удалось связаться с сервером подключения. Проверь интернет и попробуй ещё раз.';
-  if(type==='browser-incompatible') return 'Этот браузер не поддерживает нужный режим WebRTC. Обнови Safari/Chrome.';
-  return 'Не удалось подключиться. Попробуй ещё раз.';
+
+const RELAY_BROKERS = [
+  {name:'EMQX', url:'wss://broker.emqx.io:8084/mqtt'},
+  {name:'HiveMQ', url:'wss://broker.hivemq.com:8884/mqtt'},
+  {name:'Mosquitto', url:'wss://test.mosquitto.org:8081/mqtt'}
+];
+const MQTT_CDNS = [
+  'https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.14.1/mqtt.min.js',
+  'https://cdn.jsdelivr.net/npm/mqtt@5.14.1/dist/mqtt.min.js',
+  'https://unpkg.com/mqtt@5.14.1/dist/mqtt.min.js'
+];
+
+function randomId(prefix='duo'){
+  const rand=()=>Math.random().toString(36).slice(2,9);
+  return `${prefix}-${Date.now().toString(36)}-${rand()}-${rand()}`;
 }
-function wireChannel(conn){
-  state.channel=conn;
-  conn.on('open',onConnected);
-  conn.on('data',data=>{
-    try{ receive(typeof data==='string' ? JSON.parse(data) : data); }
-    catch(err){ console.error('DUO data error',err); }
+function loadExternalScript(src, timeout=9000){
+  return new Promise((resolve,reject)=>{
+    const s=document.createElement('script'); let done=false;
+    const finish=(ok,err)=>{if(done)return;done=true;clearTimeout(t);if(!ok)s.remove();ok?resolve():reject(err||new Error('load failed'));};
+    s.src=src; s.async=true; s.crossOrigin='anonymous';
+    s.onload=()=>finish(true); s.onerror=()=>finish(false,new Error('Не загрузилась библиотека связи'));
+    const t=setTimeout(()=>finish(false,new Error('Тайм-аут загрузки библиотеки связи')),timeout);
+    document.head.appendChild(s);
   });
-  conn.on('close',()=>{
-    if(state.connected){ setStatus(false,'Отключено'); toast('Партнёр отключился'); }
-  });
-  conn.on('error',err=>{ console.error('DUO connection error',err); toast('Ошибка соединения'); });
+}
+async function ensureMqtt(){
+  if(window.mqtt?.connect) return window.mqtt;
+  if(ensureMqtt.promise) return ensureMqtt.promise;
+  ensureMqtt.promise=(async()=>{
+    let lastErr;
+    for(const src of MQTT_CDNS){
+      try{
+        await loadExternalScript(src);
+        if(window.mqtt?.connect) return window.mqtt;
+      }catch(err){ lastErr=err; console.warn('DUO CDN failed',src,err); }
+    }
+    throw lastErr || new Error('Не удалось загрузить модуль связи');
+  })();
+  try{return await ensureMqtt.promise;}catch(err){ensureMqtt.promise=null;throw err;}
+}
+function bytesToB64(bytes){
+  let s=''; for(let i=0;i<bytes.length;i++) s+=String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+function b64ToBytes(s){
+  const raw=atob(s), out=new Uint8Array(raw.length); for(let i=0;i<raw.length;i++) out[i]=raw.charCodeAt(i); return out;
+}
+async function sha256Hex(text){
+  if(!crypto?.subtle) return text.replace(/[^a-z0-9]/gi,'').toLowerCase();
+  const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+async function deriveRoomKey(code){
+  if(!crypto?.subtle) return null;
+  const enc=new TextEncoder();
+  const material=await crypto.subtle.importKey('raw',enc.encode('DUO-ROOM-'+code),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name:'PBKDF2',salt:enc.encode('duo-arcade-2026-v5'),iterations:12000,hash:'SHA-256'},
+    material,{name:'AES-GCM',length:256},false,['encrypt','decrypt']
+  );
+}
+async function encodeRelayMessage(obj){
+  const raw=JSON.stringify(obj);
+  if(!state.cryptoKey) return 'p.'+btoa(unescape(encodeURIComponent(raw)));
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const data=new TextEncoder().encode(raw);
+  const cipher=await crypto.subtle.encrypt({name:'AES-GCM',iv},state.cryptoKey,data);
+  return 'e.'+bytesToB64(iv)+'.'+bytesToB64(new Uint8Array(cipher));
+}
+async function decodeRelayMessage(payload){
+  if(payload.startsWith('p.')) return JSON.parse(decodeURIComponent(escape(atob(payload.slice(2)))));
+  if(!payload.startsWith('e.') || !state.cryptoKey) throw new Error('bad payload');
+  const parts=payload.split('.'); if(parts.length!==3) throw new Error('bad payload');
+  const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64ToBytes(parts[1])},state.cryptoKey,b64ToBytes(parts[2]));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+function rememberMessage(id){
+  if(!id || state.seenMessages.has(id)) return false;
+  state.seenMessages.add(id);
+  if(state.seenMessages.size>500){
+    const first=state.seenMessages.values().next().value; state.seenMessages.delete(first);
+  }
+  return true;
+}
+async function publishEnvelope(kind,data={}){
+  if(!state.relayTopic) return;
+  const envelope={v:5,kind,data,sender:state.clientId,mid:randomId('m'),ts:Date.now()};
+  let payload;
+  try{payload=await encodeRelayMessage(envelope);}catch(err){console.error('DUO encrypt error',err);return;}
+  for(const client of state.relayClients){
+    if(client.__duoReady && client.connected){
+      try{client.publish(state.relayTopic,payload,{qos:0,retain:false});}catch(err){console.warn('DUO publish error',err);}
+    }
+  }
 }
 function send(data){
   if(state.demo) return demoRemote(data);
-  if(state.channel?.open){
-    try{ state.channel.send(JSON.stringify(data)); }
-    catch(err){ console.error('DUO send error',err); }
+  publishEnvelope('data',data);
+}
+async function handleRelayPayload(payload){
+  let env;
+  try{ env=await decodeRelayMessage(payload); }catch{return;}
+  if(!env || env.v!==5 || env.sender===state.clientId || !rememberMessage(env.mid)) return;
+  if(env.kind==='hello'){
+    if(state.remoteId && state.remoteId!==env.sender) return;
+    state.remoteId=env.sender;
+    if(!state.connected){
+      onConnected();
+      publishEnvelope('hello',{role:state.role,name:state.name});
+    }
+    if(env.data?.role && env.data?.name) receive({type:'profile',role:env.data.role,name:env.data.name});
+    return;
   }
+  if(env.kind==='bye'){
+    if(env.sender===state.remoteId){ state.remoteId=''; if(state.connected){setStatus(false,'Партнёр отключился');toast('Партнёр отключился');} }
+    return;
+  }
+  if(env.kind==='data' && (!state.remoteId || env.sender===state.remoteId)) receive(env.data);
 }
 function onConnected(){
   if(state.connected)return;
@@ -440,62 +530,93 @@ function demoRemote(msg){
 }
 
 function destroyPeer(){
-  try{ state.channel?.close(); }catch{}
-  try{ state.peer?.destroy(); }catch{}
-  state.channel=null; state.peer=null; state.roomCode='';
+  if(state.relayClients.length && state.relayTopic) publishEnvelope('bye',{});
+  for(const client of state.relayClients){
+    try{client.end(true);}catch{}
+  }
+  state.relayClients=[]; state.relayReady=0; state.relayTopic=''; state.cryptoKey=null;
+  state.clientId=''; state.remoteId=''; state.seenMessages=new Set(); state.roomCode='';
 }
-function setupPeerCommon(peer){
-  peer.on('error',err=>{
-    console.error('DUO PeerJS error',err);
-    const message=peerErrorMessage(err);
-    toast(message);
-    if(!state.connected) setStatus(false,'Ошибка подключения');
+
+async function openRelayRoom(code,{waitForPartner=false}={}){
+  const mqttLib=await ensureMqtt();
+  state.clientId=randomId(state.role||'player');
+  state.cryptoKey=await deriveRoomKey(code);
+  const hash=await sha256Hex('DUO-ARCADE-V5|'+code);
+  state.relayTopic='duo-arcade/v5/'+hash.slice(0,36)+'/events';
+  state.relayClients=[]; state.relayReady=0; state.remoteId=''; state.seenMessages=new Set();
+
+  let firstReadyResolve, firstReadyReject;
+  const firstReady=new Promise((res,rej)=>{firstReadyResolve=res;firstReadyReject=rej;});
+  let settled=false;
+  const timeout=setTimeout(()=>{
+    if(!settled){settled=true;firstReadyReject(new Error('Ни один сервер связи не ответил'));}
+  },10000);
+
+  RELAY_BROKERS.forEach((broker,index)=>{
+    let client;
+    try{
+      client=mqttLib.connect(broker.url,{
+        clientId:`duo_${index}_${Math.random().toString(16).slice(2,12)}`,
+        clean:true,keepalive:25,reconnectPeriod:3000,connectTimeout:6500,protocolVersion:4
+      });
+    }catch(err){console.warn('DUO broker init failed',broker.name,err);return;}
+    client.__duoReady=false; client.__duoName=broker.name;
+    state.relayClients.push(client);
+    client.on('connect',()=>{
+      client.subscribe(state.relayTopic,{qos:0},err=>{
+        if(err){console.warn('DUO subscribe failed',broker.name,err);return;}
+        if(!client.__duoReady){client.__duoReady=true;state.relayReady++;}
+        if(!settled){settled=true;clearTimeout(timeout);firstReadyResolve(broker.name);}
+        publishEnvelope('hello',{role:state.role,name:state.name});
+      });
+    });
+    client.on('message',(topic,message)=>{
+      if(topic!==state.relayTopic)return;
+      handleRelayPayload(message.toString());
+    });
+    client.on('error',err=>console.warn('DUO broker error',broker.name,err?.message||err));
+    client.on('close',()=>{if(client.__duoReady){client.__duoReady=false;state.relayReady=Math.max(0,state.relayReady-1);}});
   });
-  peer.on('disconnected',()=>{
-    if(!state.connected) setStatus(false,'Сервер подключения недоступен');
-  });
+
+  try{
+    const brokerName=await firstReady;
+    setStatus(false,waitForPartner?'Ищем партнёра…':'Комната готова');
+    return brokerName;
+  }catch(err){
+    for(const client of state.relayClients){try{client.end(true);}catch{}}
+    state.relayClients=[]; state.relayReady=0;
+    throw err;
+  }
 }
-function renderHostRoom(code){
+
+function renderHostRoom(code,brokerName=''){
   showSignal('КОМНАТА СОЗДАНА','Отправь девушке этот код',`
     <div class="signal-block">
       <div class="signal-label"><span>Код комнаты</span><span>6 символов</span></div>
       <div id="roomCode" class="room-code">${esc(code)}</div>
       <div class="signal-actions"><button id="copyRoomCode" class="btn primary" type="button">Скопировать код</button></div>
-      <p class="room-note">Пусть она откроет этот же сайт на iPad → «Подключиться» → введёт код. Больше ничего пересылать не нужно.</p>
+      <p class="room-note">Пусть она откроет этот же сайт на iPad → «Подключиться» → введёт код. Сайт сам выберет доступный канал связи.</p>
     </div>
-    <div class="connect-state"><span class="mini-dot"></span><span>Ждём подключение второго игрока…</span></div>`);
+    <div class="connect-state"><span class="mini-dot"></span><span>Комната онлайн${brokerName?` · ${esc(brokerName)}`:''}. Ждём второго игрока…</span></div>`);
   $('#copyRoomCode').onclick=()=>copyText(code);
-}
-function createHostPeer(attempt=0){
-  if(!peerReady()){
-    showSignal('ОШИБКА','Модуль подключения не загрузился','<div class="notice">Проверь интернет и обнови страницу. GitHub Pages должен открываться по HTTPS.</div>');
-    return;
-  }
-  const code=makeRoomCode();
-  state.roomCode=code;
-  const peer=new Peer(peerIdFromCode(code),peerOptions());
-  state.peer=peer;
-  setupPeerCommon(peer);
-  peer.on('open',()=>renderHostRoom(code));
-  peer.on('connection',conn=>{
-    if(state.channel?.open){ try{conn.close();}catch{} return; }
-    wireChannel(conn);
-  });
-  peer.on('error',err=>{
-    if(err?.type==='unavailable-id' && attempt<4){
-      try{peer.destroy();}catch{}
-      state.peer=null;
-      setTimeout(()=>createHostPeer(attempt+1),120);
-    }
-  });
 }
 async function hostFlow(){
   state.name=cleanName($('#playerName').value); state.role='host'; state.names.host=state.name; state.demo=false;
   destroyPeer();
   state.role='host'; state.name=cleanName($('#playerName').value); state.names.host=state.name;
   setStatus(false,'Создаём комнату…');
-  showSignal('СОЗДАТЕЛЬ','Создаём комнату…','<div class="notice">Получаем короткий код подключения…</div>');
-  createHostPeer();
+  showSignal('СОЗДАТЕЛЬ','Создаём комнату…','<div class="notice">Проверяем доступные каналы связи…</div>');
+  const code=makeRoomCode(); state.roomCode=code;
+  try{
+    const broker=await openRelayRoom(code,{waitForPartner:false});
+    renderHostRoom(code,broker);
+  }catch(err){
+    console.error('DUO relay start error',err);
+    setStatus(false,'Нет связи');
+    showSignal('НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ','Сеть блокирует каналы связи',`<div class="notice">Не удалось открыть ни один из резервных серверов. Попробуй отключить VPN/блокировщик или переключить интернет: Wi‑Fi ↔ мобильный.</div><div class="signal-actions"><button id="retryHost" class="btn primary" type="button">Попробовать снова</button></div>`);
+    setTimeout(()=>{const b=$('#retryHost');if(b)b.onclick=hostFlow;},0);
+  }
 }
 function joinFlow(){
   state.name=cleanName($('#playerName').value); state.role='guest'; state.names.guest=state.name; state.demo=false;
@@ -506,7 +627,7 @@ function joinFlow(){
       <div class="signal-label"><span>Код от создателя</span><span>6 символов</span></div>
       <input id="roomCodeInput" class="input room-code-input" maxlength="6" inputmode="text" autocapitalize="characters" autocomplete="off" placeholder="ABC123" />
       <div class="signal-actions"><button id="connectRoom" class="btn secondary" type="button">Подключиться</button></div>
-      <p class="room-note">Можно просто вставить короткий код, который тебе прислали.</p>
+      <p class="room-note">Вставь короткий код. Никаких длинных кодов или обратной отправки больше нет.</p>
     </div>`);
   const input=$('#roomCodeInput');
   input.addEventListener('input',()=>{ input.value=input.value.toUpperCase().replace(/[^A-Z2-9]/g,'').slice(0,6); });
@@ -514,34 +635,33 @@ function joinFlow(){
   input.addEventListener('keydown',e=>{if(e.key==='Enter')connectToRoom();});
   setTimeout(()=>input.focus(),120);
 }
-function connectToRoom(){
+async function connectToRoom(){
   const input=$('#roomCodeInput');
   const code=(input?.value||'').toUpperCase().replace(/[^A-Z2-9]/g,'');
   if(code.length!==6){ toast('Введи все 6 символов кода'); return; }
-  if(!peerReady()){ toast('Модуль подключения не загрузился. Обнови страницу.'); return; }
   state.roomCode=code;
-  const btn=$('#connectRoom'); if(btn){btn.disabled=true;btn.textContent='Соединяемся…';}
-  setStatus(false,'Соединяемся…');
-  try{ state.peer?.destroy(); }catch{}
-  state.peer=null; state.channel=null; state.connected=false;
-  const peer=new Peer(undefined,peerOptions());
-  state.peer=peer;
-  setupPeerCommon(peer);
-  peer.on('open',()=>{
-    const conn=peer.connect(peerIdFromCode(code),{reliable:true,serialization:'json'});
-    wireChannel(conn);
+  const btn=$('#connectRoom'); if(btn){btn.disabled=true;btn.textContent='Подключаемся…';}
+  setStatus(false,'Подключаемся…');
+  for(const client of state.relayClients){try{client.end(true);}catch{}}
+  state.relayClients=[]; state.relayReady=0; state.remoteId=''; state.connected=false;
+  try{
+    await openRelayRoom(code,{waitForPartner:true});
+    if(btn){btn.textContent='Ищем комнату…';}
     const timer=setTimeout(()=>{
       if(!state.connected){
         if(btn){btn.disabled=false;btn.textContent='Подключиться';}
-        toast('Не удалось соединиться. Проверь код и попробуй ещё раз.');
+        setStatus(false,'Комната не найдена');
+        toast('Пока не нашли второй экран. Проверь код; хозяин должен оставить комнату открытой.');
       }
-    },12000);
-    conn.on('open',()=>clearTimeout(timer));
-  });
-  peer.on('error',err=>{
+    },18000);
+    const poll=setInterval(()=>{if(state.connected){clearTimeout(timer);clearInterval(poll);}},300);
+    state.timers.push(timer,poll);
+  }catch(err){
+    console.error('DUO relay connect error',err);
     if(btn){btn.disabled=false;btn.textContent='Подключиться';}
-    if(err?.type==='peer-unavailable') input?.focus();
-  });
+    setStatus(false,'Нет связи');
+    toast('Сеть не пропускает доступные серверы связи. Попробуй другую сеть.');
+  }
 }
 function showSignal(eyebrow,title,html){$('#signalEyebrow').textContent=eyebrow;$('#signalTitle').textContent=title;$('#signalContent').innerHTML=html;showScreen('signal');}
 async function copyText(text){try{await navigator.clipboard.writeText(text);toast('Код скопирован')}catch{toast('Выдели код и скопируй вручную')}}
