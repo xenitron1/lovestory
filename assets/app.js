@@ -3,14 +3,14 @@ const BROKERS = [
   { name: 'EMQX', url: 'wss://broker.emqx.io:8084/mqtt' },
   { name: 'Mosquitto', url: 'wss://test.mosquitto.org:8081/mqtt' }
 ];
-const PROTOCOL = 'duo-ru-2';
+const PROTOCOL = 'duo-ru-3';
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const $ = s => document.querySelector(s);
 const state = {
   role: null, code: '', room: '', key: null, clients: [], connected: new Set(),
   peerSeen: 0, hostId: '', deviceId: crypto.randomUUID(), version: 0,
-  game: null, answers: {}, handled: new Set(), timers: [], lastSnapshotAt: 0,
-  pendingStart: null
+  game: null, localGameId: null, peerGameId: null, remoteSnapshot: null,
+  answers: {}, handled: new Set(), timers: [], lastSnapshotAt: 0
 };
 
 const GAMES = [
@@ -62,73 +62,75 @@ function connectAll(){
   BROKERS.forEach((b,index)=>{
     const client=mqtt.connect(b.url,{...b.options,clientId:'duo_'+state.deviceId.replaceAll('-','').slice(0,16)+'_'+index,clean:true,connectTimeout:7000,reconnectPeriod:2500,keepalive:18,protocolVersion:4});
     client.__name=b.name;
-    client.on('connect',()=>{state.connected.add(b.name);client.subscribe([topic('event'),topic('state'),topic('request')],{qos:1});updateConnection();setTimeout(handshake,250)});
+    client.on('connect',()=>{state.connected.add(b.name);client.subscribe([topic('event'),topic('state')],{qos:1});updateConnection();setTimeout(handshake,250)});
     client.on('message',async(t,p)=>{try{await receive(t,await open(p.toString()))}catch{}});
     const offline=()=>{state.connected.delete(b.name);updateConnection()};
     client.on('offline',offline);client.on('close',offline);client.on('error',()=>{});
     state.clients.push(client);
   });
   state.timers.push(setInterval(()=>{if(state.role==='host'&&state.game)publishSnapshot();handshake()},2500));
-  state.timers.push(setInterval(retryPendingStart,900));
   state.timers.push(setInterval(checkPeer,1500));
 }
 function disconnectAll(){state.clients.forEach(c=>{try{c.end(true)}catch{}});state.clients=[];state.connected.clear();state.timers.forEach(clearInterval);state.timers=[]}
 async function publish(kind,obj,retain=false){const packet={...obj,protocol:PROTOCOL,id:obj.id||crypto.randomUUID(),sender:state.deviceId,ts:Date.now()};const body=await seal(packet);let sent=0;state.clients.forEach(c=>{if(c.connected){sent++;c.publish(topic(kind),body,{qos:1,retain})}});return sent}
-function handshake(){if(!state.code)return;publish('event',{type:'hello',role:state.role,version:state.version})}
+function handshake(){if(!state.code)return;publish('event',{type:'hello',role:state.role,version:state.version,gameId:state.localGameId})}
 function checkPeer(){if(!state.code)return;const alive=Date.now()-state.peerSeen<7000;updateConnection(alive);if(!alive&&state.connected.size)setConnectStatus('Канал работает. Ждём второго игрока…')}
 function updateConnection(peerAlive=Date.now()-state.peerSeen<7000){const badge=$('#connectionBadge');const span=badge.querySelector('span');if(peerAlive){badge.classList.remove('muted');span.textContent='На связи'}else{badge.classList.add('muted');span.textContent=state.connected.size?`Канал: ${state.connected.size}/${BROKERS.length}`:'Переподключение…'}}
 async function receive(t,msg){
   if(msg.protocol!==PROTOCOL||msg.sender===state.deviceId)return;
   state.peerSeen=Date.now();
-  if(msg.type==='hello'){if(state.role==='host'){publishSnapshot();if(!state.game)publish('event',{type:'lobby',version:state.version})}else publish('event',{type:'hello-ack',role:'guest'});enterLobbyIfNeeded();return}
-  if(msg.type==='hello-ack'){enterLobbyIfNeeded();return}
-  if(state.handled.has(msg.id))return;state.handled.add(msg.id);if(state.handled.size>400)state.handled.delete(state.handled.values().next().value);
-  if(msg.type==='start-request'&&state.role==='host'){
-    if(Date.now()-msg.ts>120000)return;
-    startGame(msg.gameId,msg.requestId||msg.id);return
+  if(msg.type==='hello'){
+    state.peerGameId=msg.gameId||null;
+    if(state.role==='host'&&state.localGameId&&state.peerGameId===state.localGameId){
+      ensureHostGame(state.localGameId);publishSnapshot()
+    }else if(state.role==='guest')publish('event',{type:'hello-ack',role:'guest',gameId:state.localGameId});
+    enterLobbyIfNeeded();refreshWaiting();return
   }
-  if(msg.type==='answer'&&state.role==='host'&&state.game?.session===msg.session){applyAnswer('guest',msg.answer,msg.round);return}
-  if(msg.type==='leave'&&state.role==='host'){hostLobby();return}
-  if(msg.type==='lobby'&&state.role==='guest'){state.game=null;show('lobby');return}
-  if(msg.type==='snapshot'&&state.role==='guest'&&msg.version>=state.version){
+  if(msg.type==='hello-ack'){state.peerGameId=msg.gameId||null;enterLobbyIfNeeded();refreshWaiting();return}
+  if(state.handled.has(msg.id))return;state.handled.add(msg.id);if(state.handled.size>400)state.handled.delete(state.handled.values().next().value);
+  if(msg.type==='game-presence'){
+    state.peerGameId=msg.gameId||null;
+    if(state.role==='host'&&state.localGameId&&state.peerGameId===state.localGameId){
+      ensureHostGame(state.localGameId);publishSnapshot()
+    }
+    refreshWaiting();return
+  }
+  if(msg.type==='answer'&&state.role==='host'&&state.localGameId===state.game?.id&&state.game?.session===msg.session){applyAnswer('guest',msg.answer,msg.round);return}
+  if(msg.type==='snapshot'&&state.role==='guest'){
+    state.remoteSnapshot=msg;
+    if(state.localGameId!==msg.game?.id||msg.version<state.version)return;
     const pending=state.game&&msg.game&&state.game.session===msg.game.session&&state.game.round===msg.game.round?state.answers.guest:undefined;
     state.version=msg.version;state.game=msg.game;state.answers=msg.answers||{};
-    if(state.pendingStart&&state.game?.id===state.pendingStart.gameId){
-      state.pendingStart=null;setLaunchStatus('',false,true);clearRetainedRequest()
-    }
     if(pending!==undefined&&state.answers.guest===undefined)state.answers.guest=pending;
-    state.lastSnapshotAt=Date.now();if(state.game){show('game');renderGame()}else show('lobby')
+    state.lastSnapshotAt=Date.now();renderGame()
   }
 }
 function enterLobbyIfNeeded(){if(!state.game&&$('#screen-connect').classList.contains('active'))show('lobby')}
 function snapshot(){return {type:'snapshot',version:state.version,game:state.game,answers:state.answers}}
 function publishSnapshot(){if(state.role==='host')publish('state',snapshot(),true)}
 
-function startGame(gameId,requestId=null){
-  if(state.role==='guest'){
-    const id=crypto.randomUUID();
-    state.pendingStart={gameId,requestId:id,startedAt:Date.now(),attempts:0};
-    setLaunchStatus('Отправляем выбор создателю комнаты…');
-    retryPendingStart(true);return
-  }
+function startGame(gameId){
   if(!GAMES.some(g=>g.id===gameId))return;
-  if(requestId&&state.game?.requestId===requestId){publishSnapshot();return}
-  state.version++;state.game={id:gameId,session:crypto.randomUUID(),round:0,revealed:false,requestId};state.answers={};show('game');renderGame();publishSnapshot();publish('event',snapshot());
+  state.localGameId=gameId;state.answers={};
+  if(state.role==='host')ensureHostGame(gameId);
+  else if(state.remoteSnapshot?.game?.id===gameId){
+    state.version=state.remoteSnapshot.version;state.game=state.remoteSnapshot.game;state.answers=state.remoteSnapshot.answers||{}
+  }else state.game={id:gameId,session:null,round:0,revealed:false};
+  show('game');renderGame();
+  publish('event',{type:'game-presence',gameId});
+  if(state.role==='host')publishSnapshot()
 }
-function retryPendingStart(force=false){
-  const p=state.pendingStart;if(!p||state.role!=='guest')return;
-  const age=Date.now()-p.startedAt;
-  if(age>15000){state.pendingStart=null;setLaunchStatus('Создатель комнаты не подтвердил запуск. Проверьте, что у него открыт сайт, и нажмите игру ещё раз.',true);return}
-  if(!force&&state.connected.size===0){setLaunchStatus('Связь прервалась — переподключаемся…');return}
-  p.attempts++;
-  publish('request',{type:'start-request',gameId:p.gameId,requestId:p.requestId,id:p.requestId},true);
-  publish('event',{type:'start-request',gameId:p.gameId,requestId:p.requestId,id:p.requestId});
-  setLaunchStatus(p.attempts<3?'Отправляем выбор создателю комнаты…':'Ждём подтверждение запуска…');
+function ensureHostGame(gameId){
+  if(state.game?.id===gameId&&state.game.session)return;
+  state.version++;state.game={id:gameId,session:crypto.randomUUID(),round:0,revealed:false};state.answers={}
 }
-function clearRetainedRequest(){state.clients.forEach(c=>{if(c.connected)c.publish(topic('request'),'',{qos:1,retain:true})})}
-function hostLobby(){state.version++;state.game=null;state.answers={};show('lobby');publish('event',{type:'lobby',version:state.version});publishSnapshot()}
+function leaveGame(){
+  state.localGameId=null;state.game=null;state.answers={};show('lobby');
+  publish('event',{type:'game-presence',gameId:null})
+}
+function refreshWaiting(){if(state.localGameId&&state.game&&!state.game.session)renderGame()}
 function choose(answer){
-  if(!state.game||state.game.revealed)return;
+  if(!state.game||!state.game.session||state.game.revealed)return;
   const round=state.game.round;
   if(state.role==='host')applyAnswer('host',answer,round);
   else{state.answers={guest:answer};renderGame();publish('event',{type:'answer',session:state.game.session,round,answer});}
@@ -141,7 +143,7 @@ function applyAnswer(who,answer,round){
 function nextRound(){
   if(state.role!=='host')return toast('Следующий раунд запускает создатель комнаты');
   const game=GAMES.find(g=>g.id===state.game.id);
-  if(state.game.round+1>=game.questions.length)return hostLobby();
+  if(state.game.round+1>=game.questions.length)return leaveGame();
   state.version++;state.game.round++;state.game.revealed=false;state.answers={};renderGame();publishSnapshot();
 }
 
@@ -149,6 +151,9 @@ function renderGrid(){$('#gameGrid').innerHTML=GAMES.map(g=>`<button class="game
 function renderGame(){
   if(!state.game)return;const g=GAMES.find(x=>x.id===state.game.id);if(!g)return;
   const [question,choices]=g.questions[state.game.round];$('#roundLabel').textContent=`${g.name} · ${state.game.round+1}/${g.questions.length}`;
+  if(!state.game.session){
+    $('#gameStage').innerHTML=`<div class="prompt-card"><div class="big-icon">${g.icon}</div><h2>${question}</h2><p class="waiting">${state.peerGameId&&state.peerGameId!==state.localGameId?'Партнёр сейчас открыл другую игру.':'Пусть партнёр сам откроет эту же игру.'}</p></div>`;return
+  }
   const mine=state.answers[state.role],both=state.game.revealed;
   let extra='';
   if(both){const same=state.answers.host===state.answers.guest;extra=`<div class="result-pair"><div class="answer-box"><span>Создатель</span><strong>${escapeHtml(state.answers.host)}</strong></div><div class="answer-box"><span>Второй игрок</span><strong>${escapeHtml(state.answers.guest)}</strong></div></div><div class="result-title">${same?'💞 Совпало!':'✨ Интересно!'}</div>${state.role==='host'?'<button class="primary next" data-action="next">'+(state.game.round+1<g.questions.length?'Следующий раунд →':'Вернуться к играм')+'</button>':'<p class="waiting">Ждём следующий раунд…</p>'}`;if(same)confetti()
@@ -162,16 +167,16 @@ function setConnectStatus(text,error=false){const el=$('#connectStatus');el.text
 function setLaunchStatus(text,error=false,hide=false){const el=$('#launchStatus');el.textContent=text;el.hidden=hide||!text;el.classList.toggle('error',error)}
 function toast(text){const el=$('#toast');el.textContent=text;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),1900)}
 function confetti(){const root=$('#confetti');for(let i=0;i<24;i++){const e=document.createElement('i');e.style.left=Math.random()*100+'vw';e.style.background=['#ff4fa3','#8b5cf6','#58e6ff','#ffd166'][i%4];e.style.setProperty('--x',(Math.random()*160-80)+'px');e.style.animationDelay=Math.random()*.5+'s';root.append(e);setTimeout(()=>e.remove(),3000)}}
-async function createRoom(){state.role='host';await roomSetup(randomCode());state.version=0;state.game=null;state.answers={};$('#createPane').hidden=false;$('#joinPane').hidden=true;$('#roomCode').textContent=prettyCode(state.code);show('connect');connectAll()}
+async function createRoom(){state.role='host';await roomSetup(randomCode());state.version=0;state.game=null;state.localGameId=null;state.answers={};$('#createPane').hidden=false;$('#joinPane').hidden=true;$('#roomCode').textContent=prettyCode(state.code);show('connect');connectAll()}
 function joinScreen(){disconnectAll();state.role='guest';state.code='';$('#createPane').hidden=true;$('#joinPane').hidden=false;$('#joinCode').value='';setConnectStatus('');show('connect');setTimeout(()=>$('#joinCode').focus(),250)}
-async function joinRoom(e){e.preventDefault();const code=normalizeCode($('#joinCode').value);if(code.length!==10)return setConnectStatus('Код должен содержать 10 символов',true);state.role='guest';await roomSetup(code);state.version=0;state.game=null;state.answers={};setConnectStatus('Подключаемся…');connectAll()}
-function home(){disconnectAll();Object.assign(state,{role:null,code:'',room:'',key:null,peerSeen:0,game:null,answers:{},version:0,pendingStart:null});show('home');updateConnection(false)}
+async function joinRoom(e){e.preventDefault();const code=normalizeCode($('#joinCode').value);if(code.length!==10)return setConnectStatus('Код должен содержать 10 символов',true);state.role='guest';await roomSetup(code);state.version=0;state.game=null;state.localGameId=null;state.answers={};setConnectStatus('Подключаемся…');connectAll()}
+function home(){disconnectAll();Object.assign(state,{role:null,code:'',room:'',key:null,peerSeen:0,game:null,localGameId:null,peerGameId:null,remoteSnapshot:null,answers:{},version:0});show('home');updateConnection(false)}
 async function copyCode(){if(!state.code)return;try{await navigator.clipboard.writeText(state.code);toast('Код скопирован')}catch{toast(prettyCode(state.code))}}
 
 document.addEventListener('click',e=>{
   const action=e.target.closest('[data-action]')?.dataset.action;
   if(action==='create')createRoom();if(action==='join')joinScreen();if(action==='home')home();if(action==='copy-code')copyCode();
-  if(action==='leave-game'){if(state.role==='host')hostLobby();else publish('event',{type:'leave'})}
+  if(action==='leave-game')leaveGame();
   if(action==='next')nextRound();
   const game=e.target.closest('[data-game]')?.dataset.game;if(game)startGame(game);
   const answer=e.target.closest('[data-answer]')?.dataset.answer;if(answer!==undefined)choose(answer);
